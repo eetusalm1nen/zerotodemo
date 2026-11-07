@@ -24,9 +24,18 @@ def _list(name: str) -> list[str]:
     return [x.strip() for x in os.getenv(name, "").split(",") if x.strip()]
 
 
+def _mode(name: str, real: str) -> str:
+    """CALENDAR / AGENT: explicit value wins; otherwise follow MOCK (default 1 = mock)."""
+    value = os.getenv(name, "").strip().lower()
+    if value:
+        return value
+    return "mock" if _flag("MOCK", "1") else real
+
+
 @dataclass(frozen=True)
 class Settings:
-    mock: bool = field(default_factory=lambda: _flag("MOCK", "1"))
+    calendar: str = field(default_factory=lambda: _mode("CALENDAR", "google"))  # mock | google
+    agent: str = field(default_factory=lambda: _mode("AGENT", "real"))  # mock | real
     timezone: str = field(default_factory=lambda: os.getenv("TIMEZONE", "Europe/Helsinki"))
     cors_origins: list[str] = field(
         default_factory=lambda: _list("CORS_ORIGINS")
@@ -41,6 +50,10 @@ class Settings:
     google_calendar_id: str = field(default_factory=lambda: os.getenv("GOOGLE_CALENDAR_ID", "primary"))
     google_token_json: str | None = field(default_factory=lambda: os.getenv("GOOGLE_TOKEN_JSON"))
     google_token_file: str = field(default_factory=lambda: os.getenv("GOOGLE_TOKEN_FILE", "token.json"))
+
+    @property
+    def mock(self) -> bool:
+        return self.calendar == "mock" and self.agent == "mock"
 
     @property
     def tz(self) -> ZoneInfo:

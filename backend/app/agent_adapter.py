@@ -12,7 +12,7 @@ to agree with Tom:
           They are recorded on the session and returned to the UI. Never apply changes directly.
         '''
 
-With MOCK=1, or while app/agent.py doesn't exist, the keyword-based mock_agent below is used,
+With AGENT=mock (the default under MOCK=1), the keyword-based mock_agent below is used,
 so the UI always gets realistic replies and proposals.
 """
 
@@ -33,7 +33,7 @@ AgentFn = Callable[[str, Session, AgentTools], str]
 
 
 def get_agent() -> AgentFn:
-    if settings.mock:
+    if settings.agent == "mock":
         return mock_agent
     try:
         from .agent import run_agent  # type: ignore[import-not-found]  # noqa: PLC0415

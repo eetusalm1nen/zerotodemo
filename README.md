@@ -19,6 +19,32 @@ Open http://localhost:8000/docs for the interactive API docs.
 cd backend && pytest -q
 ```
 
+Python 3.10 or newer is required (`python3 --version`). The macOS system Python is 3.9: install a newer one with `brew install python@3.12` and create the venv with `python3.12 -m venv .venv`.
+
+### Modes
+| Variable | Values | Default |
+|---|---|---|
+| `CALENDAR` | `mock` (in-memory) or `google` (the demo account) | follows `MOCK` |
+| `AGENT` | `mock` (keyword bot) or `real` (Tom's agent in `app/agent.py`) | follows `MOCK` |
+| `MOCK` | `1` = both mock, `0` = both real | `1` |
+
+### Google Calendar (demo account)
+One-time setup in Google Cloud Console:
+1. Create a project, then enable **Google Calendar API**.
+2. Set up the **OAuth consent screen**: type External, and add the demo Gmail under *Test users*.
+3. Go to **Credentials → Create OAuth client ID → Desktop app**, download the JSON and save it as `backend/client_secret.json`.
+
+From `backend/`, with the venv active:
+```bash
+python scripts/google_auth.py      # opens the browser; sign in with the demo Gmail and writes token.json
+python scripts/seed.py             # fills the calendar with the demo fortnight
+python scripts/seed.py --reset     # wipe what the demo created and seed again
+CALENDAR=google AGENT=mock uvicorn app.main:app --port 8000
+```
+For Render, set `CALENDAR=google` and paste the contents of `token.json` into `GOOGLE_TOKEN_JSON`.
+In Google's *Testing* mode the sign-in expires after 7 days; run `google_auth.py` again if that happens.
+Never commit `client_secret.json` or `token.json`.
+
 ### Mock mode (`MOCK=1`)
 Every endpoint returns realistic data in the exact contract shape:
 - A two-week busy calendar (standups, a 1:1 with Tom, an investor call and more) that tracks the current date. On a weekend it starts from the coming Monday.

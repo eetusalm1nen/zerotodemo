@@ -16,10 +16,10 @@ from ..errors import CalendarError
 from ..models import Event
 from ..timeutil import now, to_local, week_start
 
-ME = "demo@zerotodemo.app"
-TOM = "tom@zerotodemo.app"
-MARIUS = "marius@zerotodemo.app"
-EETU = "eetu@zerotodemo.app"
+ME = "demo@example.com"
+TOM = "tom@example.com"
+MARIUS = "marius@example.com"
+EETU = "eetu@example.com"
 
 # (weekday 0=Mon, start "HH:MM", minutes, title, location, attendees, description)
 _ONE_OFFS_WEEK1 = [

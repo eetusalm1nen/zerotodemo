@@ -59,7 +59,8 @@ install_error_handlers(app)
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    return HealthResponse(mock=settings.mock, calendar="mock" if settings.mock else "google", version=VERSION)
+    return HealthResponse(mock=settings.mock, calendar="mock" if settings.calendar == "mock" else "google",
+                          version=VERSION)
 
 
 @app.get("/events", response_model=EventsResponse)
