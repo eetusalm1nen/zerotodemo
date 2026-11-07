@@ -1,45 +1,112 @@
-"""Seam between POST /chat and the agent.
+"""Bridge between POST /chat and the agent.
 
-The agent (system prompt, tool schemas, loop) belongs to Tom. The proposed interface,
-to agree with Tom:
+The agent itself (prompt, tool schemas, loop) is Tom's code in backend/agent/agent.py.
+Its interface:
 
-    # app/agent.py
-    def run_agent(message: str, session: Session, tools: AgentTools) -> str:
-        '''Run one user turn and return the assistant's reply text.
-        - Read and append session.history yourself (any message format you like).
-        - Call tools.list_events / tools.find_free_slots to read the calendar.
-        - Call tools.propose_move / propose_create / propose_delete to suggest changes.
-          They are recorded on the session and returned to the UI. Never apply changes directly.
-        '''
+    run_chat(session, message, calendar) -> {"reply", "proposed_changes", "status"}
 
-With AGENT=mock (the default under MOCK=1), the keyword-based mock_agent below is used,
-so the UI always gets realistic replies and proposals.
+where `calendar` needs list_events(start, end) and find_free_slots(...), with ISO strings
+and plain dicts. AgentCalendar below provides that on top of our CalendarBackend.
+
+AGENT=mock uses the keyword-based mock_agent instead (no API key needed).
 """
 
 from __future__ import annotations
 
+import logging
 import re
-from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 
+from .calendar.base import CalendarBackend
 from .config import settings
 from .errors import ApiError
-from .models import Event
+from .free_slots import find_free_slots
+from .models import Event, ProposedChange
 from .sessions import Session
-from .timeutil import fmt_short, now
+from .timeutil import fmt_short, now, to_local
 from .tools import AgentTools
 
-AgentFn = Callable[[str, Session, AgentTools], str]
+log = logging.getLogger(__name__)
 
 
-def get_agent() -> AgentFn:
+def run_turn(message: str, session: Session, calendar: CalendarBackend) -> tuple[str, list[ProposedChange]]:
+    """Run one chat turn. Returns (reply, changes proposed in this turn)."""
     if settings.agent == "mock":
-        return mock_agent
+        tools = AgentTools(calendar, session)
+        reply = mock_agent(message, session, tools)
+        return reply, tools.proposed_this_turn
+    return run_real_agent(message, session, calendar)
+
+
+# ------------------------------------------------------------------ Tom's agent
+
+
+def _iso(dt: datetime) -> str:
+    return to_local(dt).isoformat(timespec="seconds")
+
+
+def _parse(value: str) -> datetime:
+    return to_local(datetime.fromisoformat(value.replace("Z", "+00:00")))
+
+
+def category_of(ev: Event) -> str:
+    """Rough category for the agent: focus / personal / meeting / other (Google has no such field)."""
+    title = ev.title.lower()
+    if ev.all_day:
+        return "other"
+    if title.startswith(("focus", "deep work")):
+        return "focus"
+    if not ev.attendees or any(w in title for w in ("lunch", "gym", "dentist", "doctor", "drinks", "sauna")):
+        return "personal"
+    return "meeting"
+
+
+class AgentCalendar:
+    """Tom's Calendar protocol (ISO strings in, dicts out) on top of our CalendarBackend."""
+
+    def __init__(self, calendar: CalendarBackend):
+        self.cal = calendar
+
+    def list_events(self, start: str, end: str) -> list[dict]:
+        return [
+            {
+                "id": ev.id,
+                "title": ev.title,
+                "start": _iso(ev.start),
+                "end": _iso(ev.end),
+                "movable": ev.movable,
+                "category": category_of(ev),
+                "all_day": ev.all_day,
+                "location": ev.location,
+            }
+            for ev in self.cal.list_events(_parse(start), _parse(end))
+        ]
+
+    def find_free_slots(self, duration_minutes: int, range_start: str, range_end: str,
+                        earliest_hour: int = 8, latest_hour: int = 18) -> list[dict]:
+        s, e = _parse(range_start), _parse(range_end)
+        slots = find_free_slots(
+            self.cal.list_events(s, e), s, e,
+            duration_minutes=duration_minutes, earliest_hour=earliest_hour, latest_hour=latest_hour,
+            tz=settings.tz, now=now(),
+        )
+        return [{"start": _iso(x.start), "end": _iso(x.end)} for x in slots]
+
+
+def run_real_agent(message: str, session: Session, calendar: CalendarBackend, client=None):
     try:
-        from .agent import run_agent  # type: ignore[import-not-found]  # noqa: PLC0415
+        from agent.agent import Session as AgentSession  # noqa: PLC0415
+        from agent.agent import run_chat  # noqa: PLC0415
     except ImportError as exc:
-        raise ApiError(503, "agent_unavailable", "Agent is not installed yet (app/agent.py missing)") from exc
-    return run_agent
+        raise ApiError(503, "agent_unavailable", "Agent is not installed (backend/agent/agent.py)") from exc
+
+    agent_session = AgentSession(id=session.id, messages=session.history)
+    out = run_chat(agent_session, message, AgentCalendar(calendar), client=client)
+    if out.get("status") == "error":
+        raise ApiError(502, "agent_error", out.get("reply") or "The assistant failed. Please try again.")
+    session.history = agent_session.messages
+    changes = [ProposedChange.model_validate(c) for c in out.get("proposed_changes", [])]
+    return out.get("reply", ""), changes
 
 
 # ------------------------------------------------------------------ mock agent

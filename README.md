@@ -61,8 +61,10 @@ backend/app/
   free_slots.py     deterministic free-slot finder
   tools.py          agent tool implementations, plus apply_change
   sessions.py       in-memory sessions (chat history, proposed changes)
-  agent_adapter.py  seam for Tom's run_agent; mock agent
+  agent_adapter.py  bridge to Tom's agent (AgentCalendar), plus the mock agent
+backend/agent/      Tom's agent: agent.py (Claude loop, prompt, tools), cli.py, fake_calendar.py
 ```
+`CONTRACT.md` describes both the API that the UI uses (Part 1) and the agent ↔ backend interface (Part 2).
 
 ### Deploy (Render)
 1. In Render, go to **New → Blueprint** and pick this repo. `render.yaml` sets up the service with `MOCK=1`.

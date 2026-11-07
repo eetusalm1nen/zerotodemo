@@ -4,6 +4,9 @@
 > change both in the same commit. Changes need sign-off from UI (Marius, Eetu) and agent (Tom).
 > Defined by the backend, not by the UI's v0 (UI please confirm): the `/apply` response and
 > failure shape, `status: "ok"`, and the `movable` field on events.
+>
+> Part 1 (Endpoints) is what the UI uses. Part 2 (Agent) is internal: how Tom's agent
+> (`backend/agent/agent.py`) talks to the backend. The UI never calls it directly.
 
 Base URL: the deployed Render service (see README). All bodies are JSON (`Content-Type: application/json`).
 
@@ -48,6 +51,7 @@ Base URL: the deployed Render service (see README). All bodies are JSON (`Conten
 | 409  | `not_found`         | `/apply`: the event no longer exists |
 | 422  | `validation_error`  | Body or query failed schema validation. `details.errors` lists the problems |
 | 502  | `calendar_error`    | Google Calendar call failed (in `/apply`: after rollback) |
+| 502  | `agent_error`       | `/chat`: the AI agent failed (e.g. Claude API down). `message` is safe to show to the user |
 | 503  | `agent_unavailable` | Chat agent not configured                          |
 | 500  | `internal_error`    | Anything else                                      |
 
@@ -145,8 +149,12 @@ Request:
 }
 ```
 - `status`: `"needs_confirmation"` when `proposed_changes` is non-empty (the changes wait for approval), otherwise `"ok"`.
-`proposed_changes` lists only the changes proposed in **this** turn, and may be empty.
-Every proposed change stays in the session and can be applied later by `id`.
+- `proposed_changes` lists the changes proposed in **this** turn, and may be empty.
+- **A new set of proposals replaces the previous pending set.** When a turn proposes changes,
+  earlier unapplied proposals in the session are discarded, and `/apply` with their ids returns
+  `change_not_found`. A turn with no proposals (for example a question) keeps the pending set.
+  The UI should show only the latest set.
+- The call can take 5–20 seconds with the real agent. Show a loading state.
 
 ### POST /apply
 Request:
@@ -188,3 +196,83 @@ On failure, the response uses the normal error format, and nothing is applied:
 - A rolled-back delete is restored with the same details but a **new event id** (Google Calendar cannot restore an id).
 - After a failure the changes are not marked applied, so the same request can be retried.
 - An unknown `session_id` returns `404 session_not_found`.
+
+---
+
+# Part 2: Agent (internal)
+
+How the AI agent plugs into the backend. Owner of the agent: Tom. Owner of the calendar layer: Topi.
+
+## Flow of one `/chat` turn
+
+```
+POST /chat ──► app/agent_adapter.py ──► agent.run_chat(session, message, calendar)
+                                             │  loop: Claude ⇄ tools (max AGENT_MAX_STEPS)
+                                             ▼
+               calendar = AgentCalendar ──► CalendarBackend (mock or Google)
+```
+1. The backend calls `run_chat(session, message, calendar)` in `backend/agent/agent.py`.
+2. The agent asks Claude, which calls the tools below. Read tools go to the calendar; propose tools only record proposals.
+3. `run_chat` returns `{"reply", "proposed_changes", "status"}`. The backend validates every change against the `ProposedChange` model and stores them in the session.
+4. The calendar changes only later, through `POST /apply` (validate everything, apply in order, roll back on failure).
+
+Status mapping from the agent to the API: `needs_confirmation` → `needs_confirmation`, `done` → `ok`,
+`error` → HTTP 502 `agent_error`.
+
+## Agent tools (what Claude can call)
+
+| Tool | Input | Output | Changes the calendar? |
+|---|---|---|---|
+| `list_events` | `start`, `end` | `{"events": [AgentEvent]}` | no |
+| `find_free_slots` | `duration_minutes`, `range_start`, `range_end`, `earliest_hour` (8), `latest_hour` (18) | `{"slots": [{"start", "end"}], "note"?}` | no |
+| `propose_move` | `event_id`, `new_start`, `new_end`, `reason` | `{"recorded": ProposedChange}` | no, proposal only |
+| `propose_create` | `title`, `start`, `end`, `reason` | `{"recorded": ProposedChange}` | no, proposal only |
+| `propose_delete` | `event_id`, `reason` | `{"recorded": ProposedChange}` | no, proposal only |
+
+A rejected call (unknown id, locked event, overlap, time in the past, missing reason) returns an
+error message to Claude so it can correct itself. The exact schemas are `TOOLS` in `agent.py`.
+
+**AgentEvent** (what `list_events` gives Claude):
+```json
+{ "id": "evt_8f2a", "title": "1:1 with Tom", "start": "2026-11-09T10:00:00+02:00",
+  "end": "2026-11-09T10:30:00+02:00", "movable": true, "category": "meeting",
+  "all_day": false, "location": "Zoom" }
+```
+`category` is `meeting`, `focus`, `personal` or `other`. The backend derives it from the title and
+attendees (Google Calendar has no such field).
+
+## Calendar interface the agent needs (provided by the backend)
+
+```python
+class Calendar(Protocol):
+    def list_events(self, start: str, end: str) -> list[dict]: ...            # AgentEvent dicts
+    def find_free_slots(self, duration_minutes: int, range_start: str, range_end: str,
+                        earliest_hour: int = 8, latest_hour: int = 18) -> list[dict]: ...
+```
+All times are ISO 8601 strings with an offset. `AgentCalendar` in `app/agent_adapter.py` implements
+this on top of the backend's calendar (mock or Google). `find_free_slots` is deterministic code:
+it merges busy times, skips weekends and the past, and ignores all-day events.
+
+## Rules the agent follows (enforced in code, not only in the prompt)
+
+- It never writes to the calendar; it only proposes.
+- It never proposes changes to events with `movable: false`.
+- Proposals must not overlap existing events or each other, must not be in the past, and must have a short `reason`.
+- Change ids are generated in code, never by the model.
+- A failed turn does not change the session history.
+
+## Configuration
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `AGENT` | `real` = Tom's agent, `mock` = keyword bot (no API key needed) | follows `MOCK` |
+| `ANTHROPIC_API_KEY` | Claude API key. Set it in Render's environment, never in git | none |
+| `AGENT_MODEL` | Claude model | `claude-sonnet-5-5` |
+| `AGENT_MAX_STEPS` | max tool-loop steps per turn | `10` |
+| `DEMO_NOW` | fixed "now" for rehearsals, e.g. `2026-11-10T08:30:00+02:00` | real time |
+
+## Local development (Tom)
+
+From `backend/agent/`: `python cli.py` chats with the agent against `fake_calendar.py`.
+To use the full backend instead, from `backend/`:
+`AGENT=real CALENDAR=mock uvicorn app.main:app --port 8000`, then `POST /chat`.

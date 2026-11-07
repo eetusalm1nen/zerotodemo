@@ -105,18 +105,51 @@ def test_locked_event_is_not_proposed(client):
     assert chat.proposed_changes == [] and "locked" in chat.reply
 
 
+def _batch():
+    """A session with three pending changes (move, create, delete), built without chat."""
+    from datetime import timedelta
+
+    from app.calendar import get_calendar
+    from app.sessions import sessions
+    from app.timeutil import now
+    from app.tools import AgentTools
+
+    cal = get_calendar()
+    s = sessions.create()
+    t = AgentTools(cal, s)
+    evs = {e.title: e for e in cal.list_events(now(), now() + timedelta(days=5))}
+    tom, dentist = evs["1:1 with Tom"], evs["Dentist"]
+    a = t.propose_move(tom.id, tom.start + timedelta(days=1), tom.end + timedelta(days=1))
+    b = t.propose_create("Meeting with Anna", tom.start + timedelta(days=2), tom.end + timedelta(days=2))
+    c = t.propose_delete(dentist.id)
+    return s.id, [a, b, c]
+
+
 def test_apply_all_succeed(client):
-    _, a = _propose(client, "Move my 1:1 with Tom")
-    _, b = _propose(client, "Schedule a meeting with Anna", a.session_id)
-    ids = [a.proposed_changes[0].id, b.proposed_changes[0].id]
-    r = client.post("/apply", json={"session_id": a.session_id, "change_ids": ids})
+    sid, changes = _batch()
+    ids = [c.id for c in changes]
+    r = client.post("/apply", json={"session_id": sid, "change_ids": ids})
     assert r.status_code == 200, r.text
     body = ApplyResponse.model_validate(r.json())
     assert body.status == "applied" and [x.change_id for x in body.applied] == ids
-    assert body.applied[0].event.start == a.proposed_changes[0].new_start
+    assert body.applied[0].event.start == changes[0].new_start
     # applying again is rejected
-    r = client.post("/apply", json={"session_id": a.session_id, "change_ids": ids[:1]})
+    r = client.post("/apply", json={"session_id": sid, "change_ids": ids[:1]})
     assert r.status_code == 409 and r.json()["error"]["code"] == "already_applied"
+
+
+def test_new_proposals_replace_pending_ones(client):
+    _, first = _propose(client, "Move my 1:1 with Tom")
+    _, second = _propose(client, "cancel the dentist", first.session_id)
+    r = client.post("/apply", json={"session_id": first.session_id, "change_ids": [first.proposed_changes[0].id]})
+    assert r.status_code == 404 and r.json()["error"]["code"] == "change_not_found"
+    r = client.post("/apply", json={"session_id": first.session_id, "change_ids": [second.proposed_changes[0].id]})
+    assert r.status_code == 200
+    # a turn without proposals keeps the pending set
+    _, third = _propose(client, "Move my 1:1 with Tom", first.session_id)
+    _propose(client, "When am I free?", first.session_id)
+    r = client.post("/apply", json={"session_id": first.session_id, "change_ids": [third.proposed_changes[0].id]})
+    assert r.status_code == 200
 
 
 def test_apply_unknown_change_touches_nothing(client):
@@ -130,9 +163,7 @@ def test_apply_unknown_change_touches_nothing(client):
 
 
 def test_apply_rolls_back_on_midway_failure(client, monkeypatch):
-    _, a = _propose(client, "Move my 1:1 with Tom")
-    _, b = _propose(client, "Schedule a meeting with Anna", a.session_id)
-    _, c = _propose(client, "cancel the dentist", a.session_id)
+    sid, changes = _batch()
     before = client.get("/events").json()
 
     from app import main
@@ -145,8 +176,8 @@ def test_apply_rolls_back_on_midway_failure(client, monkeypatch):
         return real(calendar, change)
 
     monkeypatch.setattr(main, "apply_change", flaky)
-    ids = [a.proposed_changes[0].id, b.proposed_changes[0].id, c.proposed_changes[0].id]
-    r = client.post("/apply", json={"session_id": a.session_id, "change_ids": ids})
+    ids = [c.id for c in changes]
+    r = client.post("/apply", json={"session_id": sid, "change_ids": ids})
     assert r.status_code == 502
     err = r.json()["error"]
     assert err["code"] == "calendar_error" and err["details"]["failed_change_id"] == ids[2]
@@ -154,7 +185,7 @@ def test_apply_rolls_back_on_midway_failure(client, monkeypatch):
     assert client.get("/events").json() == before
     # nothing marked applied, so a retry works once the problem is gone
     monkeypatch.setattr(main, "apply_change", real)
-    assert client.post("/apply", json={"session_id": a.session_id, "change_ids": ids}).status_code == 200
+    assert client.post("/apply", json={"session_id": sid, "change_ids": ids}).status_code == 200
 
 
 def test_apply_duplicate_ids(client):

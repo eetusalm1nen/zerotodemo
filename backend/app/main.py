@@ -8,7 +8,7 @@ from datetime import timedelta
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from .agent_adapter import get_agent
+from .agent_adapter import run_turn
 from .calendar import get_calendar
 from .config import VERSION, settings
 from .errors import ApiError, install_error_handlers
@@ -26,7 +26,7 @@ from .models import (
 )
 from .sessions import sessions
 from .timeutil import now, parse_query_dt, start_of_day
-from .tools import AgentTools, apply_change, undo_change
+from .tools import apply_change, undo_change
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("calendar-api")
@@ -81,11 +81,11 @@ def list_events(
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
     session = sessions.get_or_create(req.session_id)
-    agent = get_agent()
     with session.lock:
-        tools = AgentTools(get_calendar(), session)
-        reply = agent(req.message, session, tools)
-    changes = tools.proposed_this_turn
+        reply, changes = run_turn(req.message, session, get_calendar())
+        if changes:
+            # A new set of proposals replaces the previous pending set (as the agent's prompt promises).
+            session.proposed = {c.id: c for c in changes}
     return ChatResponse(
         session_id=session.id,
         reply=reply,

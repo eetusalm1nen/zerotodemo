@@ -2,6 +2,8 @@ fastapi==0.162.2
 uvicorn[standard]==0.54.0
 pydantic==2.13.5
 python-dotenv==1.2.3
+# Agent (Tom)
+anthropic>=0.40
 # Google Calendar (task 2)
 google-api-python-client>=2.150
 google-auth>=2.35

@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Smoke test (no API key needed)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/smoke_test.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Agent CLI (real Claude, uses .env)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/backend/agent/cli.py",
+      "cwd": "${workspaceFolder}/backend/agent",
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/backend/.env",
+      "env": { "DEMO_NOW": "2026-11-10T08:30:00+02:00" },
+      "justMyCode": true
+    }
+  ]
+}
