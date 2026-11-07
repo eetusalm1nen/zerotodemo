@@ -28,7 +28,8 @@ def test_events_default_range(client):
     assert all(_offset(e["start"]) and _offset(e["end"]) for e in raw["events"])
     # every key present, even nulls
     assert set(raw["events"][0]) == {"id", "title", "start", "end", "all_day", "location", "description",
-                                     "attendees", "recurring_event_id"}
+                                     "attendees", "recurring_event_id", "movable"}
+    assert any(not e.movable for e in body.events)
     standups = [e for e in body.events if e.recurring_event_id == "rec_standup"]
     assert len(standups) >= 5 and len({e.id for e in standups}) == len(standups)
 
@@ -65,46 +66,107 @@ def test_chat_unknown_session(client):
     assert r.status_code == 404 and r.json()["error"]["code"] == "session_not_found"
 
 
-def test_chat_move_then_apply(client):
-    r = client.post("/chat", json={"message": "Move my 1:1 with Tom"})
+CHANGE_KEYS = {"id", "type", "event_id", "title", "old_start", "old_end", "new_start", "new_end", "reason"}
+
+
+def _propose(client, message, session_id=None):
+    r = client.post("/chat", json={"session_id": session_id, "message": message})
     assert r.status_code == 200, r.text
-    chat = ChatResponse.model_validate(r.json())
-    if not chat.proposed_changes:  # 1:1 already in the past this week -> fine, try standup
-        r = client.post("/chat", json={"session_id": chat.session_id, "message": "move daily standup"})
-        chat = ChatResponse.model_validate(r.json())
-    assert chat.proposed_changes, chat.reply
-    change = chat.proposed_changes[0]
-    assert change.action == "move"
-
-    r = client.post("/apply", json={"session_id": chat.session_id, "change_ids": [change.id, "chg_missing", change.id]})
-    assert r.status_code == 200
-    res = ApplyResponse.model_validate(r.json()).results
-    assert [x.status for x in res] == ["applied", "failed", "failed"]
-    assert res[0].event.start == change.start
-    assert res[1].error.code == "change_not_found"
-    assert res[2].error.code == "already_applied"
+    return r.json(), ChatResponse.model_validate(r.json())
 
 
-def test_apply_reports_missing_event(client):
-    r = client.post("/chat", json={"message": "cancel the daily standup"})
-    chat = ChatResponse.model_validate(r.json())
-    if not chat.proposed_changes:
-        return  # all standups this week already past
-    cid = chat.proposed_changes[0].id
-    from app.calendar import get_calendar
-
-    get_calendar().delete_event(chat.proposed_changes[0].event_id)
-    r = client.post("/apply", json={"session_id": chat.session_id, "change_ids": [cid]})
-    res = r.json()["results"][0]
-    assert res["status"] == "failed" and res["error"]["code"] == "not_found"
+def test_chat_move_shape_and_status(client):
+    raw, chat = _propose(client, "Move my 1:1 with Tom")
+    assert chat.status == "needs_confirmation"
+    assert set(raw["proposed_changes"][0]) == CHANGE_KEYS
+    c = chat.proposed_changes[0]
+    assert c.type == "move" and c.event_id and c.old_start and c.new_start and c.reason
 
 
-def test_chat_create_and_free(client):
-    r = client.post("/chat", json={"message": "Schedule a 1 hour meeting with Anna"})
-    chat = ChatResponse.model_validate(r.json())
-    assert chat.proposed_changes and chat.proposed_changes[0].action == "create"
-    r = client.post("/chat", json={"session_id": chat.session_id, "message": "When am I free?"})
-    assert r.status_code == 200 and r.json()["session_id"] == chat.session_id
+def test_chat_no_changes_status_ok(client):
+    _, chat = _propose(client, "When am I free?")
+    assert chat.status == "ok" and chat.proposed_changes == []
+
+
+def test_create_has_null_old_and_event_id(client):
+    raw, chat = _propose(client, "Schedule a 1 hour meeting with Anna")
+    c = raw["proposed_changes"][0]
+    assert c["type"] == "create" and c["event_id"] is None and c["old_start"] is None and c["old_end"] is None
+
+
+def test_delete_has_null_new(client):
+    raw, _ = _propose(client, "cancel the dentist")
+    c = raw["proposed_changes"][0]
+    assert c["type"] == "delete" and c["new_start"] is None and c["new_end"] is None
+
+
+def test_locked_event_is_not_proposed(client):
+    _, chat = _propose(client, "Move the customer demo with Acme")
+    assert chat.proposed_changes == [] and "locked" in chat.reply
+
+
+def test_apply_all_succeed(client):
+    _, a = _propose(client, "Move my 1:1 with Tom")
+    _, b = _propose(client, "Schedule a meeting with Anna", a.session_id)
+    ids = [a.proposed_changes[0].id, b.proposed_changes[0].id]
+    r = client.post("/apply", json={"session_id": a.session_id, "change_ids": ids})
+    assert r.status_code == 200, r.text
+    body = ApplyResponse.model_validate(r.json())
+    assert body.status == "applied" and [x.change_id for x in body.applied] == ids
+    assert body.applied[0].event.start == a.proposed_changes[0].new_start
+    # applying again is rejected
+    r = client.post("/apply", json={"session_id": a.session_id, "change_ids": ids[:1]})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "already_applied"
+
+
+def test_apply_unknown_change_touches_nothing(client):
+    _, a = _propose(client, "Move my 1:1 with Tom")
+    before = client.get("/events").json()
+    r = client.post("/apply", json={"session_id": a.session_id, "change_ids": [a.proposed_changes[0].id, "chg_nope"]})
+    assert r.status_code == 404
+    err = ErrorResponse.model_validate(r.json()).error
+    assert err.code == "change_not_found" and err.details["failed_change_id"] == "chg_nope"
+    assert client.get("/events").json() == before
+
+
+def test_apply_rolls_back_on_midway_failure(client, monkeypatch):
+    _, a = _propose(client, "Move my 1:1 with Tom")
+    _, b = _propose(client, "Schedule a meeting with Anna", a.session_id)
+    _, c = _propose(client, "cancel the dentist", a.session_id)
+    before = client.get("/events").json()
+
+    from app import main
+
+    real = main.apply_change
+
+    def flaky(calendar, change):
+        if change.type == "delete":
+            raise RuntimeError("Google exploded")
+        return real(calendar, change)
+
+    monkeypatch.setattr(main, "apply_change", flaky)
+    ids = [a.proposed_changes[0].id, b.proposed_changes[0].id, c.proposed_changes[0].id]
+    r = client.post("/apply", json={"session_id": a.session_id, "change_ids": ids})
+    assert r.status_code == 502
+    err = r.json()["error"]
+    assert err["code"] == "calendar_error" and err["details"]["failed_change_id"] == ids[2]
+    assert err["details"]["rolled_back"] is True
+    assert client.get("/events").json() == before
+    # nothing marked applied, so a retry works once the problem is gone
+    monkeypatch.setattr(main, "apply_change", real)
+    assert client.post("/apply", json={"session_id": a.session_id, "change_ids": ids}).status_code == 200
+
+
+def test_apply_duplicate_ids(client):
+    _, a = _propose(client, "Move my 1:1 with Tom")
+    cid = a.proposed_changes[0].id
+    r = client.post("/apply", json={"session_id": a.session_id, "change_ids": [cid, cid]})
+    assert r.status_code == 400
+
+
+def test_apply_unknown_session(client):
+    r = client.post("/apply", json={"session_id": "ses_nope", "change_ids": ["chg_x"]})
+    assert r.status_code == 404 and r.json()["error"]["code"] == "session_not_found"
 
 
 def test_cors_lovable(client):

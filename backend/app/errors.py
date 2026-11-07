@@ -32,7 +32,8 @@ class CalendarError(ApiError):
     """Raised by calendar backends. Inside /apply it becomes a per-change failure."""
 
     def __init__(self, message: str, code: str = "calendar_error", details: dict[str, Any] | None = None):
-        super().__init__(404 if code == "not_found" else 502, code, message, details)
+        status = {"not_found": 404, "event_locked": 409, "bad_request": 400}.get(code, 502)
+        super().__init__(status, code, message, details)
 
 
 def _respond(status: int, code: str, message: str, details: dict[str, Any] | None = None) -> JSONResponse:

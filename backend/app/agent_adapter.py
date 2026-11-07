@@ -49,7 +49,7 @@ _STOP = {"my", "the", "with", "to", "a", "an", "on", "at", "and", "meeting", "pl
          "afternoon", "morning", "later", "earlier", "book", "schedule", "add", "create", "for", "i", "is"}
 
 
-def _match_event(message: str, events: list[Event]) -> Event | None:
+def _best_match(message: str, events: list[Event]) -> tuple[Event | None, int]:
     words = [w for w in re.findall(r"[a-zA-Z0-9:]+", message.lower()) if w not in _STOP and len(w) > 1]
     best, best_score = None, 0
     for ev in events:
@@ -57,7 +57,11 @@ def _match_event(message: str, events: list[Event]) -> Event | None:
         score = sum(1 for w in words if w in title)
         if score > best_score:
             best, best_score = ev, score
-    return best
+    return best, best_score
+
+
+def _match_event(message: str, events: list[Event]) -> Event | None:
+    return _best_match(message, events)[0]
 
 
 def mock_agent(message: str, session: Session, tools: AgentTools) -> str:
@@ -65,6 +69,7 @@ def mock_agent(message: str, session: Session, tools: AgentTools) -> str:
     t0 = now()
     horizon = t0 + timedelta(days=7)
     upcoming = [e for e in tools.list_events(t0, horizon) if not e.all_day]
+    changeable = [e for e in upcoming if e.movable]
     session.history.append({"role": "user", "content": message})
 
     def slots_after(start, minutes: int):
@@ -81,27 +86,31 @@ def mock_agent(message: str, session: Session, tools: AgentTools) -> str:
         return t0
 
     if any(k in msg for k in ("move", "reschedule", "push", "postpone")):
-        ev = _match_event(message, upcoming)
-        if ev is None:
+        locked, locked_score = _best_match(message, [e for e in upcoming if not e.movable])
+        ev, ev_score = _best_match(message, changeable)
+        if locked is not None and locked_score > ev_score:
+            ev, reply = None, f'"{locked.title}" is locked, so I can\'t move it.'
+        elif ev is None:
             reply = "Which meeting should I move? I couldn't match one in the next 7 days."
-        else:
+        if ev is not None:
             minutes = int((ev.end - ev.start).total_seconds() // 60)
             slots = [s for s in slots_after(search_from(), minutes) if s.start != ev.start]
             if not slots:
                 reply = f'I couldn\'t find a free {minutes}-minute slot for "{ev.title}" this week.'
             else:
                 new_start = slots[0].start
-                tools.propose_move(ev.id, new_start, new_start + (ev.end - ev.start))
+                tools.propose_move(ev.id, new_start, new_start + (ev.end - ev.start),
+                                   reason=f"First free {minutes}-minute slot that fits your request.")
                 reply = (
                     f'"{ev.title}" is on {fmt_short(ev.start)}. The first free {minutes}-minute slot is '
                     f"{fmt_short(new_start)}. Want me to move it there?"
                 )
     elif any(k in msg for k in ("cancel", "delete", "remove", "clear")):
-        ev = _match_event(message, upcoming)
+        ev = _match_event(message, changeable)
         if ev is None:
             reply = "Which event should I cancel?"
         else:
-            tools.propose_delete(ev.id)
+            tools.propose_delete(ev.id, reason="You asked to cancel it.")
             reply = f'I can cancel "{ev.title}" on {fmt_short(ev.start)}. Confirm to apply.'
     elif any(k in msg for k in ("book", "schedule", "add", "create", "set up", "plan")):
         minutes = 60 if ("hour" in msg or "60" in msg) else 30
@@ -112,7 +121,8 @@ def mock_agent(message: str, session: Session, tools: AgentTools) -> str:
             m = re.search(r"(?:with|called|for)\s+([A-Za-z][\w ]{1,40})", message)
             title = f"Meeting with {m.group(1).strip().title()}" if m and "with" in m.group(0) else "New meeting"
             start = slots[0].start
-            tools.propose_create(title, start, start + timedelta(minutes=minutes))
+            tools.propose_create(title, start, start + timedelta(minutes=minutes),
+                                 reason=f"First free {minutes}-minute slot in your working hours.")
             reply = f'How about {fmt_short(start)} for "{title}" ({minutes} min)? I\'ve prepared it for you to confirm.'
     elif any(k in msg for k in ("free", "available", "open", "gap")):
         slots = slots_after(search_from(), 30)

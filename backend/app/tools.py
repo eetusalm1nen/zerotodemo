@@ -25,18 +25,45 @@ from .timeutil import fmt_short, now, to_local
 
 
 def _change_id() -> str:
+    # Change ids (and new event ids) are always created by the server, never by the LLM.
     return "chg_" + uuid.uuid4().hex[:10]
+
+
+def _locked(ev: Event) -> CalendarError:
+    return CalendarError(f'"{ev.title}" is locked and cannot be changed', code="event_locked",
+                         details={"event_id": ev.id})
 
 
 def apply_change(calendar: CalendarBackend, change: ProposedChange) -> Event:
     """Run one change against the calendar. Raises CalendarError on failure."""
-    if change.action == "move":
-        return calendar.move_event(change.event_id, change.start, change.end)  # type: ignore[arg-type]
-    if change.action == "create":
-        return calendar.create_event(change.title, change.start, change.end)  # type: ignore[arg-type]
-    if change.action == "delete":
+    if change.type in ("move", "delete"):
+        current = calendar.get_event(change.event_id)  # type: ignore[arg-type]
+        if not current.movable:
+            raise _locked(current)
+    if change.type == "move":
+        return calendar.move_event(change.event_id, change.new_start, change.new_end)  # type: ignore[arg-type]
+    if change.type == "create":
+        return calendar.create_event(change.title, change.new_start, change.new_end)  # type: ignore[arg-type]
+    if change.type == "delete":
         return calendar.delete_event(change.event_id)  # type: ignore[arg-type]
-    raise CalendarError(f"Unknown action {change.action}", code="bad_request")
+    raise CalendarError(f"Unknown change type {change.type}", code="bad_request")
+
+
+def undo_change(calendar: CalendarBackend, change: ProposedChange, result: Event) -> None:
+    """Best-effort reversal of an applied change, used to roll back a failed batch.
+
+    A deleted event is recreated with the same details, but it gets a new id
+    (Google Calendar cannot restore an id).
+    """
+    if change.type == "move":
+        calendar.move_event(result.id, change.old_start, change.old_end)  # type: ignore[arg-type]
+    elif change.type == "create":
+        calendar.delete_event(result.id)
+    elif change.type == "delete":
+        calendar.create_event(
+            result.title, result.start, result.end,
+            description=result.description, location=result.location, attendees=result.attendees,
+        )
 
 
 class AgentTools:
@@ -75,52 +102,57 @@ class AgentTools:
         )
 
     # ---- proposal tools (record only; nothing touches the calendar until /apply)
+    # They raise CalendarError(code="event_locked") for a locked event; hand that back to the model.
 
     def _record(self, change: ProposedChange) -> ProposedChange:
         self.session.add_proposals([change])
         self.proposed_this_turn.append(change)
         return change
 
-    def propose_move(self, event_id: str, start: datetime, end: datetime) -> ProposedChange:
+    def propose_move(self, event_id: str, start: datetime, end: datetime, reason: str | None = None) -> ProposedChange:
         ev = self.calendar.get_event(event_id)
+        if not ev.movable:
+            raise _locked(ev)
         start, end = to_local(start), to_local(end)
         return self._record(
             ProposedChange(
                 id=_change_id(),
-                action="move",
+                type="move",
                 event_id=ev.id,
                 title=ev.title,
-                start=start,
-                end=end,
-                original_start=ev.start,
-                original_end=ev.end,
-                summary=f'Move "{ev.title}" from {fmt_short(ev.start)} to {fmt_short(start)}',
+                old_start=ev.start,
+                old_end=ev.end,
+                new_start=start,
+                new_end=end,
+                reason=reason or f'Move "{ev.title}" from {fmt_short(ev.start)} to {fmt_short(start)}',
             )
         )
 
-    def propose_create(self, title: str, start: datetime, end: datetime) -> ProposedChange:
+    def propose_create(self, title: str, start: datetime, end: datetime, reason: str | None = None) -> ProposedChange:
         start, end = to_local(start), to_local(end)
         return self._record(
             ProposedChange(
                 id=_change_id(),
-                action="create",
+                type="create",
                 title=title,
-                start=start,
-                end=end,
-                summary=f'Create "{title}" on {fmt_short(start)}–{end:%H:%M}',
+                new_start=start,
+                new_end=end,
+                reason=reason or f'Create "{title}" on {fmt_short(start)}–{end:%H:%M}',
             )
         )
 
-    def propose_delete(self, event_id: str) -> ProposedChange:
+    def propose_delete(self, event_id: str, reason: str | None = None) -> ProposedChange:
         ev = self.calendar.get_event(event_id)
+        if not ev.movable:
+            raise _locked(ev)
         return self._record(
             ProposedChange(
                 id=_change_id(),
-                action="delete",
+                type="delete",
                 event_id=ev.id,
                 title=ev.title,
-                original_start=ev.start,
-                original_end=ev.end,
-                summary=f'Delete "{ev.title}" on {fmt_short(ev.start)}',
+                old_start=ev.start,
+                old_end=ev.end,
+                reason=reason or f'Delete "{ev.title}" on {fmt_short(ev.start)}',
             )
         )

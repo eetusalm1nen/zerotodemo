@@ -45,6 +45,15 @@ _ONE_OFFS_WEEK2 = [
 ]
 
 
+# Locked events (movable=false): external commitments the assistant must not touch.
+_LOCKED_TITLES = {
+    "Customer demo: Acme Oy",
+    "Investor call: Northstar VC",
+    "Offsite planning workshop",
+    "Zero To Demo hackathon",
+}
+
+
 def _stable_id(*parts: object) -> str:
     return "evt_" + hashlib.sha1("|".join(map(str, parts)).encode()).hexdigest()[:10]
 
@@ -74,6 +83,7 @@ def seed_events(anchor: datetime | None = None) -> list[Event]:
                 description=description,
                 attendees=[ME, *attendees] if attendees else [],
                 recurring_event_id=rec,
+                movable=title not in _LOCKED_TITLES,
             )
         )
 
@@ -100,6 +110,7 @@ def seed_events(anchor: datetime | None = None) -> list[Event]:
             end=datetime.combine(sat + timedelta(days=1), time(0), tzinfo=settings.tz),
             all_day=True,
             location="San Francisco",
+            movable=False,
         )
     )
     events.sort(key=lambda e: e.start)

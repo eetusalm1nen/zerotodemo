@@ -9,6 +9,8 @@ from .errors import ApiError
 
 
 def now() -> datetime:
+    if settings.demo_now:
+        return datetime.fromisoformat(settings.demo_now).astimezone(settings.tz)
     return datetime.now(settings.tz)
 
 

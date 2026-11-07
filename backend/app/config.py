@@ -35,6 +35,8 @@ class Settings:
     cors_origin_regex: str = field(
         default_factory=lambda: os.getenv("CORS_ORIGIN_REGEX", DEFAULT_CORS_REGEX)
     )
+    # Optional fixed "now" (ISO 8601), e.g. 2026-11-09T08:00:00+02:00. Makes tests and demos repeatable.
+    demo_now: str | None = field(default_factory=lambda: os.getenv("DEMO_NOW") or None)
     # Google Calendar (used when MOCK=0)
     google_calendar_id: str = field(default_factory=lambda: os.getenv("GOOGLE_CALENDAR_ID", "primary"))
     google_token_json: str | None = field(default_factory=lambda: os.getenv("GOOGLE_TOKEN_JSON"))

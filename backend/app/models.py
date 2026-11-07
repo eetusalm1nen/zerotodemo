@@ -41,47 +41,51 @@ class Event(_Strict):
     description: str | None = None
     attendees: list[str] = Field(default_factory=list)
     recurring_event_id: str | None = None
+    # Locked events (movable=false) are never moved or deleted.
+    movable: bool = True
 
 
-ChangeAction = Literal["move", "create", "delete"]
+ChangeType = Literal["move", "create", "delete"]
 
 
 class ProposedChange(_Strict):
+    """Field names follow the UI's CONTRACT v0."""
+
     id: str
-    action: ChangeAction
+    type: ChangeType
     event_id: str | None = None
     title: str
-    start: AwareDatetime | None = None
-    end: AwareDatetime | None = None
-    original_start: AwareDatetime | None = None
-    original_end: AwareDatetime | None = None
-    summary: str
+    old_start: AwareDatetime | None = None
+    old_end: AwareDatetime | None = None
+    new_start: AwareDatetime | None = None
+    new_end: AwareDatetime | None = None
+    reason: str
 
     @model_validator(mode="after")
     def _check_shape(self) -> ProposedChange:
-        a = self.action
-        need_event = a in ("move", "delete")
-        need_new = a in ("move", "create")
-        need_orig = a in ("move", "delete")
+        t = self.type
+        has_event = t in ("move", "delete")
+        has_old = t in ("move", "delete")
+        has_new = t in ("move", "create")
 
-        def present(*vals: object) -> bool:
-            return all(v is not None for v in vals)
+        def both(a: object, b: object) -> bool:
+            return a is not None and b is not None
 
-        def absent(*vals: object) -> bool:
-            return all(v is None for v in vals)
+        def neither(a: object, b: object) -> bool:
+            return a is None and b is None
 
-        if need_event != (self.event_id is not None):
-            raise ValueError(f"{a}: event_id must be {'set' if need_event else 'null'}")
-        if need_new and not present(self.start, self.end):
-            raise ValueError(f"{a}: start and end are required")
-        if not need_new and not absent(self.start, self.end):
-            raise ValueError(f"{a}: start and end must be null")
-        if need_orig and not present(self.original_start, self.original_end):
-            raise ValueError(f"{a}: original_start and original_end are required")
-        if not need_orig and not absent(self.original_start, self.original_end):
-            raise ValueError(f"{a}: original_start and original_end must be null")
-        if self.start and self.end and self.end <= self.start:
-            raise ValueError("end must be after start")
+        if has_event != (self.event_id is not None):
+            raise ValueError(f"{t}: event_id must be {'set' if has_event else 'null'}")
+        if has_old and not both(self.old_start, self.old_end):
+            raise ValueError(f"{t}: old_start and old_end are required")
+        if not has_old and not neither(self.old_start, self.old_end):
+            raise ValueError(f"{t}: old_start and old_end must be null")
+        if has_new and not both(self.new_start, self.new_end):
+            raise ValueError(f"{t}: new_start and new_end are required")
+        if not has_new and not neither(self.new_start, self.new_end):
+            raise ValueError(f"{t}: new_start and new_end must be null")
+        if self.new_start and self.new_end and self.new_end <= self.new_start:
+            raise ValueError("new_end must be after new_start")
         return self
 
 
@@ -115,6 +119,8 @@ class ChatRequest(_Strict):
 class ChatResponse(_Strict):
     session_id: str
     reply: str
+    # "needs_confirmation" when proposed_changes is non-empty, otherwise "ok".
+    status: Literal["needs_confirmation", "ok"]
     proposed_changes: list[ProposedChange]
 
 
@@ -123,13 +129,16 @@ class ApplyRequest(_Strict):
     change_ids: list[str] = Field(min_length=1)
 
 
-class ApplyResult(_Strict):
+class AppliedChange(_Strict):
     change_id: str
-    status: Literal["applied", "failed"]
-    event: Event | None = None
-    error: ErrorBody | None = None
+    type: ChangeType
+    # The event after the change; for delete, the event as it was before deletion.
+    event: Event
 
 
 class ApplyResponse(_Strict):
+    """Returned only when every change succeeded (all or nothing)."""
+
     session_id: str
-    results: list[ApplyResult]
+    status: Literal["applied"] = "applied"
+    applied: list[AppliedChange]
